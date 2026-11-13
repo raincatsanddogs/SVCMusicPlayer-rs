@@ -7,3 +7,4 @@
 *.ps1
 playlist.json
 config.toml
+/tests

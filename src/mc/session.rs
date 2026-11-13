@@ -9,15 +9,21 @@ use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::app::{AppManager, GroupAction};
 use crate::audio::AudioPlayer;
+use crate::config::GroupConfig;
 use crate::mc::chat_handler::ChatHandler;
 use crate::voice::protocol::{
-    create_group_payload, join_group_payload, parse_joined_group_packet,
-    parse_remove_group_packet, read_varint, SvcGroup,
+    client_state_payload, create_group_payload, join_group_payload, parse_joined_group_packet,
+    parse_player_states_packet, parse_remove_group_packet, parse_remove_state_packet, read_varint,
+    svc_register_channels, SvcGroup, SvcPlayerState, CHANNEL_ADD_CATEGORY, CHANNEL_ADD_GROUP,
+    CHANNEL_CREATE_GROUP, CHANNEL_JOINED_GROUP, CHANNEL_LEAVE_GROUP, CHANNEL_PLAYER_STATES_LEGACY,
+    CHANNEL_PLAYER_STATE_LEGACY, CHANNEL_REMOVE_CATEGORY, CHANNEL_REMOVE_GROUP,
+    CHANNEL_REMOVE_STATE, CHANNEL_REQUEST_SECRET, CHANNEL_SECRET, CHANNEL_SET_GROUP, CHANNEL_STATE,
+    CHANNEL_STATES,
 };
 use crate::voice::VoiceClient;
 
@@ -141,19 +147,29 @@ async fn handle_bot_event(
             tokio::spawn(async move {
                 while let Some(action) = group_rx.recv().await {
                     match action {
-                        GroupAction::JoinOrCreate { name, password, group_type } => {
+                        GroupAction::JoinOrCreate {
+                            name,
+                            password,
+                            group_type,
+                            auto_create,
+                        } => {
                             if let Some(existing) = app_clone_grp.find_group_by_name(&name).await {
                                 info!(
                                     "[MC-Group] 发现已存在同名群组 \"{}\" (UUID: {})，直接加入...",
                                     existing.name, existing.id
                                 );
                                 send_join_group(&bot_clone_grp, existing.id, password.as_deref());
-                            } else {
+                            } else if auto_create {
                                 info!(
-                                    "[MC-Group] 未检测到名为 \"{}\" 的群组，正在创建并加入公开群组...",
-                                    name
+                                    "[MC-Group] 未检测到名为 \"{}\" 的群组，正在创建并加入群组 (type: {})...",
+                                    name, group_type
                                 );
                                 send_create_group(&bot_clone_grp, &name, password.as_deref(), group_type);
+                            } else {
+                                warn!(
+                                    "[MC-Group] 未检测到名为 \"{}\" 的群组，且 auto_create = false，跳过自动创建。",
+                                    name
+                                );
                             }
                         }
                         GroupAction::JoinById { id, password } => {
@@ -195,15 +211,22 @@ async fn handle_bot_event(
             if let ClientboundGamePacket::CustomPayload(cp) = packet.as_ref() {
                 let channel = cp.identifier.to_string();
                 if channel.starts_with("voicechat:") {
-                    info!("[MC] 收到 SVC 插件通道消息: channel={}, 数据大小={} 字节", channel, cp.data.len());
+                    debug!("[MC] 收到 SVC 插件通道消息: channel={}, 数据大小={} 字节", channel, cp.data.len());
                 }
-                if channel == "voicechat:secret" {
+                if channel == CHANNEL_SECRET {
                     app.secret_received.store(true, Ordering::SeqCst);
-                    info!("[MC] 成功捕获服务端下发的 voicechat:secret 插件消息！");
+                    info!("[MC] 成功捕获服务端下发的 {} 插件消息 ({} 字节)！", CHANNEL_SECRET, cp.data.len());
+                    let mut server_groups_enabled = true;
                     if let Ok(secret_data) = parse_secret_packet(&cp.data) {
+                        server_groups_enabled = secret_data.groups_enabled;
+                        app.set_bot_uuid(secret_data.player_uuid).await;
                         info!(
-                            "[MC] 解析 SVC 协商凭证成功: port={}, uuid={}, host={}",
-                            secret_data.server_port, secret_data.player_uuid, secret_data.voice_host
+                            "[MC] 解析 SVC 协商凭证成功: port={}, uuid={}, host={}, groups_enabled={}, allow_recording={}",
+                            secret_data.server_port,
+                            secret_data.player_uuid,
+                            secret_data.voice_host,
+                            secret_data.groups_enabled,
+                            secret_data.allow_recording
                         );
 
                         // 自适应解析 UDP 真实连接地址（防止服务端下发带端口导致双重端口解析错误）
@@ -220,6 +243,7 @@ async fn handle_bot_event(
                             Ok(mut addrs) => {
                                 if let Some(addr) = addrs.next() {
                                     let app_clone = Arc::clone(&app);
+                                    let bot_clone = bot.clone();
                                     tokio::spawn(async move {
                                         match VoiceClient::connect(addr, secret_data.player_uuid, secret_data.secret).await {
                                             Ok(voice_client) => {
@@ -233,6 +257,12 @@ async fn handle_bot_event(
                                                     app_clone.event_tx.clone(),
                                                 ));
                                                 app_clone.bind_voice_player(voice_client, player).await;
+                                                send_client_state(
+                                                    &bot_clone,
+                                                    app_clone.config.minecraft.compatibility_version,
+                                                    false,
+                                                    false,
+                                                );
                                                 info!("[MC] 语音伴播服务整体初始化成功！已成功连接 SVC 语音通道。");
                                             }
                                             Err(e) => {
@@ -250,32 +280,16 @@ async fn handle_bot_event(
                         }
                     }
 
-                    // 启动自动加入或创建群组任务
-                    if app.config.voice.group.enabled {
+                    // 启动可配置的进服自动加入/创建群组任务
+                    if let Some(action) = resolve_startup_group_action(&app.config.voice.group, server_groups_enabled) {
                         let app_grp = Arc::clone(&app);
                         tokio::spawn(async move {
                             // 等待 800ms 让服务端将全部已存在的 add_group 包下发完成
                             tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
-                            let target_name = app_grp.config.voice.group.name.clone();
-                            let password = if app_grp.config.voice.group.password.is_empty() {
-                                None
-                            } else {
-                                Some(app_grp.config.voice.group.password.clone())
-                            };
-                            let group_type = match app_grp.config.voice.group.group_type.to_lowercase().as_str() {
-                                "isolated" => 2,
-                                "open" => 1,
-                                _ => 0,
-                            };
-
-                            app_grp.send_group_action(GroupAction::JoinOrCreate {
-                                name: target_name,
-                                password,
-                                group_type,
-                            }).await;
+                            app_grp.send_group_action(action).await;
                         });
                     }
-                } else if channel == "voicechat:add_group" {
+                } else if channel == CHANNEL_ADD_GROUP {
                     if let Ok(group) = SvcGroup::from_bytes(&cp.data) {
                         info!(
                             "[MC-Group] 收到服务端群组通知: \"{}\" (UUID: {}, 类型: {})",
@@ -283,12 +297,12 @@ async fn handle_bot_event(
                         );
                         app.update_known_group(group).await;
                     }
-                } else if channel == "voicechat:remove_group" {
+                } else if channel == CHANNEL_REMOVE_GROUP {
                     if let Ok(id) = parse_remove_group_packet(&cp.data) {
                         info!("[MC-Group] 服务端通知群组已解散或移除 (UUID: {})", id);
                         app.remove_known_group(id).await;
                     }
-                } else if channel == "voicechat:joined_group" {
+                } else if channel == CHANNEL_JOINED_GROUP {
                     if let Ok((group_id, wrong_pwd)) = parse_joined_group_packet(&cp.data) {
                         if wrong_pwd {
                             warn!("[MC-Group] 加入群组失败: 密码错误！");
@@ -311,6 +325,33 @@ async fn handle_bot_event(
                             app.set_current_group(None).await;
                         }
                     }
+                } else if channel == CHANNEL_STATE || channel == CHANNEL_PLAYER_STATE_LEGACY {
+                    if let Ok(st) = SvcPlayerState::from_bytes(&cp.data) {
+                        if app.get_bot_uuid().await == Some(st.uuid) {
+                            info!(
+                                "[MC-State] 服务端同步假人语音状态: disabled={}, disconnected={}, group={:?}",
+                                st.disabled, st.disconnected, st.group
+                            );
+                        } else {
+                            debug!(
+                                "[MC-State] 更新玩家状态: {} ({}) disabled={}, disconnected={}, group={:?}",
+                                st.name, st.uuid, st.disabled, st.disconnected, st.group
+                            );
+                        }
+                        app.update_player_state(st).await;
+                    }
+                } else if channel == CHANNEL_STATES || channel == CHANNEL_PLAYER_STATES_LEGACY {
+                    if let Ok(states) = parse_player_states_packet(&cp.data) {
+                        info!("[MC-State] 收到服务端全量玩家语音状态快照 ({} 条)", states.len());
+                        app.replace_player_states(states).await;
+                    }
+                } else if channel == CHANNEL_REMOVE_STATE {
+                    if let Ok(id) = parse_remove_state_packet(&cp.data) {
+                        debug!("[MC-State] 服务端移除玩家语音状态: {}", id);
+                        app.remove_player_state(id).await;
+                    }
+                } else if channel == CHANNEL_ADD_CATEGORY || channel == CHANNEL_REMOVE_CATEGORY {
+                    debug!("[MC] 收到音量分类通道消息: {} ({} 字节)", channel, cp.data.len());
                 }
             }
         }
@@ -328,15 +369,61 @@ async fn handle_bot_event(
     Ok(())
 }
 
+/// 根据配置与服务端群组开关解析进服后应执行的自动入群动作
+pub fn resolve_startup_group_action(cfg: &GroupConfig, server_groups_enabled: bool) -> Option<GroupAction> {
+    if !cfg.enabled {
+        info!("[MC-Group] 配置项 voice.group.enabled = false，跳过进服自动入群");
+        return None;
+    }
+    if !server_groups_enabled {
+        warn!("[MC-Group] 服务端未启用语音群组功能 (groups_enabled=false)，跳过自动入群");
+        return None;
+    }
+
+    let password = if cfg.password.is_empty() {
+        None
+    } else {
+        Some(cfg.password.clone())
+    };
+
+    let id_str = cfg.id.trim();
+    if !id_str.is_empty() {
+        match Uuid::parse_str(id_str) {
+            Ok(id) => return Some(GroupAction::JoinById { id, password }),
+            Err(e) => {
+                error!("[MC-Group] 配置的 voice.group.id \"{}\" 不是合法 UUID ({})，取消自动入群", id_str, e);
+                return None;
+            }
+        }
+    }
+
+    let name = cfg.name.trim();
+    if name.is_empty() {
+        warn!("[MC-Group] 已启用自动入群但未配置 voice.group.name 或 voice.group.id，跳过自动入群");
+        return None;
+    }
+
+    let group_type = match cfg.group_type.to_lowercase().as_str() {
+        "isolated" => 2,
+        "open" => 1,
+        _ => 0,
+    };
+
+    Some(GroupAction::JoinOrCreate {
+        name: name.to_string(),
+        password,
+        group_type,
+        auto_create: cfg.auto_create,
+    })
+}
+
 /// 向 Minecraft 服务端发送 Simple Voice Chat 插件通道注册及握手请求
 fn send_voicechat_handshake(bot: &Client, compat_version: i32) {
-    // 1. 发送通道注册包 minecraft:register
+    // 1. 发送通道注册包 minecraft:register（随 compatibility_version 自动匹配 2.6.x 新通道或旧通道）
     if let Ok(ident) = Identifier::from_str("minecraft:register") {
         let payload = ServerboundCustomPayload {
             identifier: ident,
-            data: UnsizedByteArray::from(
-                b"voicechat:secret\0voicechat:request_secret\0voicechat:player_state\0voicechat:player_states\0voicechat:add_group\0voicechat:remove_group\0voicechat:joined_group\0voicechat:create_group\0voicechat:set_group\0voicechat:leave_group".to_vec(),
-            ),
+            data: UnsizedByteArray::from(svc_register_channels(compat_version)),
         };
         bot.write_packet(payload);
     }
@@ -345,13 +432,29 @@ fn send_voicechat_handshake(bot: &Client, compat_version: i32) {
     let mut req_data = Vec::new();
     let _ = req_data.write_i32::<BigEndian>(compat_version);
 
-    if let Ok(ident) = Identifier::from_str("voicechat:request_secret") {
+    if let Ok(ident) = Identifier::from_str(CHANNEL_REQUEST_SECRET) {
         let payload = ServerboundCustomPayload {
             identifier: ident,
             data: UnsizedByteArray::from(req_data),
         };
         bot.write_packet(payload);
-        info!("[MC] 已发送 voicechat:request_secret (版本号: {})", compat_version);
+        info!("[MC] 已发送 {} (版本号: {})", CHANNEL_REQUEST_SECRET, compat_version);
+    }
+}
+
+/// 向服务端同步客户端语音状态（SVC 2.6.x 使用 voicechat:client_state，旧版使用 voicechat:update_state）
+pub fn send_client_state(bot: &Client, compat_version: i32, muted: bool, disabled: bool) {
+    let (channel, data) = client_state_payload(compat_version, muted, disabled);
+    if let Ok(ident) = Identifier::from_str(channel) {
+        let payload = ServerboundCustomPayload {
+            identifier: ident,
+            data: UnsizedByteArray::from(data),
+        };
+        bot.write_packet(payload);
+        info!(
+            "[MC-State] 已向服务端发送 {} (muted={}, disabled={})",
+            channel, muted, disabled
+        );
     }
 }
 
@@ -359,7 +462,9 @@ struct ParsedSecret {
     secret: [u8; 16],
     server_port: u16,
     player_uuid: Uuid,
+    groups_enabled: bool,
     voice_host: String,
+    allow_recording: bool,
 }
 
 fn parse_secret_packet(data: &[u8]) -> anyhow::Result<ParsedSecret> {
@@ -378,18 +483,21 @@ fn parse_secret_packet(data: &[u8]) -> anyhow::Result<ParsedSecret> {
     let _mtu_size = cursor.read_i32::<BigEndian>()?;
     let _voice_distance = cursor.read_f64::<BigEndian>()?;
     let _keep_alive = cursor.read_i32::<BigEndian>()?;
-    let _groups_enabled = cursor.read_u8()? != 0;
+    let groups_enabled = cursor.read_u8()? != 0;
 
     let host_len = read_varint(&mut cursor)? as usize;
     let mut host_bytes = vec![0u8; host_len];
     cursor.read_exact(&mut host_bytes)?;
     let voice_host = String::from_utf8(host_bytes).unwrap_or_default();
+    let allow_recording = cursor.read_u8().map(|v| v != 0).unwrap_or(false);
 
     Ok(ParsedSecret {
         secret,
         server_port,
         player_uuid,
+        groups_enabled,
         voice_host,
+        allow_recording,
     })
 }
 
@@ -446,7 +554,7 @@ pub fn resolve_voice_address(
 
 /// 发送 voicechat:create_group 创建并加入新群组
 pub fn send_create_group(bot: &Client, name: &str, password: Option<&str>, group_type: i16) {
-    if let Ok(ident) = Identifier::from_str("voicechat:create_group") {
+    if let Ok(ident) = Identifier::from_str(CHANNEL_CREATE_GROUP) {
         if let Ok(data) = create_group_payload(name, password, group_type) {
             let payload = ServerboundCustomPayload {
                 identifier: ident,
@@ -454,8 +562,8 @@ pub fn send_create_group(bot: &Client, name: &str, password: Option<&str>, group
             };
             bot.write_packet(payload);
             info!(
-                "[MC-Group] 已向服务端发送 voicechat:create_group (name: \"{}\", type: {})",
-                name, group_type
+                "[MC-Group] 已向服务端发送 {} (name: \"{}\", type: {})",
+                CHANNEL_CREATE_GROUP, name, group_type
             );
         }
     }
@@ -463,27 +571,27 @@ pub fn send_create_group(bot: &Client, name: &str, password: Option<&str>, group
 
 /// 发送 voicechat:set_group 加入已存在的群组
 pub fn send_join_group(bot: &Client, group_id: Uuid, password: Option<&str>) {
-    if let Ok(ident) = Identifier::from_str("voicechat:set_group") {
+    if let Ok(ident) = Identifier::from_str(CHANNEL_SET_GROUP) {
         if let Ok(data) = join_group_payload(group_id, password) {
             let payload = ServerboundCustomPayload {
                 identifier: ident,
                 data: UnsizedByteArray::from(data),
             };
             bot.write_packet(payload);
-            info!("[MC-Group] 已向服务端发送 voicechat:set_group (group_id: {})", group_id);
+            info!("[MC-Group] 已向服务端发送 {} (group_id: {})", CHANNEL_SET_GROUP, group_id);
         }
     }
 }
 
 /// 发送 voicechat:leave_group 离开群组
 pub fn send_leave_group(bot: &Client) {
-    if let Ok(ident) = Identifier::from_str("voicechat:leave_group") {
+    if let Ok(ident) = Identifier::from_str(CHANNEL_LEAVE_GROUP) {
         let payload = ServerboundCustomPayload {
             identifier: ident,
             data: UnsizedByteArray::from(Vec::new()),
         };
         bot.write_packet(payload);
-        info!("[MC-Group] 已向服务端发送 voicechat:leave_group");
+        info!("[MC-Group] 已向服务端发送 {}", CHANNEL_LEAVE_GROUP);
     }
 }
 

@@ -434,6 +434,7 @@ pub async fn execute_command(
                         name: name.clone(),
                         password,
                         group_type,
+                        auto_create: true,
                     })
                     .await;
                     app.send_game_chat(&format!("[Bot] 正在加入或创建群组: \"{}\"...", name)).await;

@@ -44,11 +44,15 @@ replay_gain = true
 target_lufs = -16.0
 
 [voice.group]
-# 是否在进服时自动创建或加入 SVC 语音群组（进群后全服群成员无视距离与维度收听）
+# 是否在进服后自动加入（或创建）SVC 语音群组（进群后全服群成员无视距离与维度收听）
 enabled = true
-# 目标群组名称（若不存在则自动创建，若已存在则直接加入）
+# 可选：指定目标群组的 UUID（非空时优先按 UUID 直接加入，忽略下方 name 与 auto_create）
+id = ""
+# 目标群组名称（当 id 为空时按名称匹配服务端现有群组）
 name = "Music"
-# 群组类型: "open" (开放群组，身边非群员也能听到), "normal" (普通群组), "isolated" (私密隔离群组)
+# 当服务端尚不存在同名群组时，是否自动创建该群组（false 表示仅加入已存在的群组，不主动创建）
+auto_create = true
+# 自动创建时的群组类型: "open" (开放群组，身边非群员也能听到), "normal" (普通群组), "isolated" (私密隔离群组)
 group_type = "open"
 # 群组密码（留空表示无密码公开群组）
 password = ""

@@ -73,21 +73,27 @@ fn default_voice_bitrate() -> u32 {
 pub struct GroupConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub id: String,
     #[serde(default = "default_group_name")]
     pub name: String,
     #[serde(default = "default_group_type")]
     pub group_type: String, // "open", "normal", "isolated"
     #[serde(default)]
     pub password: String,
+    #[serde(default = "default_true")]
+    pub auto_create: bool,
 }
 
 impl Default for GroupConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            id: String::new(),
             name: default_group_name(),
             group_type: default_group_type(),
             password: String::new(),
+            auto_create: true,
         }
     }
 }

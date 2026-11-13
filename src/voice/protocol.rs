@@ -6,6 +6,75 @@ use uuid::Uuid;
 
 pub const MAGIC_BYTE: u8 = 0xFF;
 
+// Simple Voice Chat Minecraft Plugin Channel IDs (SVC 2.6.x+, compatibility_version >= 20)
+pub const CHANNEL_SECRET: &str = "voicechat:secret";
+pub const CHANNEL_REQUEST_SECRET: &str = "voicechat:request_secret";
+pub const CHANNEL_CLIENT_STATE: &str = "voicechat:client_state";
+pub const CHANNEL_STATE: &str = "voicechat:state";
+pub const CHANNEL_STATES: &str = "voicechat:states";
+pub const CHANNEL_REMOVE_STATE: &str = "voicechat:remove_state";
+pub const CHANNEL_ADD_GROUP: &str = "voicechat:add_group";
+pub const CHANNEL_REMOVE_GROUP: &str = "voicechat:remove_group";
+pub const CHANNEL_JOINED_GROUP: &str = "voicechat:joined_group";
+pub const CHANNEL_CREATE_GROUP: &str = "voicechat:create_group";
+pub const CHANNEL_SET_GROUP: &str = "voicechat:set_group";
+pub const CHANNEL_LEAVE_GROUP: &str = "voicechat:leave_group";
+pub const CHANNEL_ADD_CATEGORY: &str = "voicechat:add_category";
+pub const CHANNEL_REMOVE_CATEGORY: &str = "voicechat:remove_category";
+
+// Legacy Plugin Channel IDs (SVC <= 2.5.x, compatibility_version < 20)
+pub const CHANNEL_UPDATE_STATE_LEGACY: &str = "voicechat:update_state";
+pub const CHANNEL_PLAYER_STATE_LEGACY: &str = "voicechat:player_state";
+pub const CHANNEL_PLAYER_STATES_LEGACY: &str = "voicechat:player_states";
+
+/// 根据 compatibility_version 构造 `minecraft:register` 的 `\0` 分隔通道列表
+pub fn svc_register_channels(compat_version: i32) -> Vec<u8> {
+    let channels: &[&str] = if compat_version >= 20 {
+        &[
+            CHANNEL_SECRET,
+            CHANNEL_REQUEST_SECRET,
+            CHANNEL_CLIENT_STATE,
+            CHANNEL_STATE,
+            CHANNEL_STATES,
+            CHANNEL_REMOVE_STATE,
+            CHANNEL_ADD_GROUP,
+            CHANNEL_REMOVE_GROUP,
+            CHANNEL_JOINED_GROUP,
+            CHANNEL_CREATE_GROUP,
+            CHANNEL_SET_GROUP,
+            CHANNEL_LEAVE_GROUP,
+            CHANNEL_ADD_CATEGORY,
+            CHANNEL_REMOVE_CATEGORY,
+        ]
+    } else {
+        &[
+            CHANNEL_SECRET,
+            CHANNEL_REQUEST_SECRET,
+            CHANNEL_UPDATE_STATE_LEGACY,
+            CHANNEL_PLAYER_STATE_LEGACY,
+            CHANNEL_PLAYER_STATES_LEGACY,
+            CHANNEL_ADD_GROUP,
+            CHANNEL_REMOVE_GROUP,
+            CHANNEL_JOINED_GROUP,
+            CHANNEL_CREATE_GROUP,
+            CHANNEL_SET_GROUP,
+            CHANNEL_LEAVE_GROUP,
+            CHANNEL_ADD_CATEGORY,
+            CHANNEL_REMOVE_CATEGORY,
+        ]
+    };
+    channels.join("\0").into_bytes()
+}
+
+/// 构造客户端语音状态同步包 (SVC 2.6.x 使用 `voicechat:client_state`, 旧版使用 `voicechat:update_state`)
+pub fn client_state_payload(compat_version: i32, muted: bool, disabled: bool) -> (&'static str, Vec<u8>) {
+    if compat_version >= 20 {
+        (CHANNEL_CLIENT_STATE, vec![muted as u8, disabled as u8])
+    } else {
+        (CHANNEL_UPDATE_STATE_LEGACY, vec![disabled as u8])
+    }
+}
+
 // Packet Type IDs defined by Simple Voice Chat protocol
 pub const PKT_MIC: u8 = 0x01;
 pub const PKT_PLAYER_SOUND: u8 = 0x02;
@@ -236,11 +305,77 @@ pub fn parse_joined_group_packet(bytes: &[u8]) -> io::Result<(Option<Uuid>, bool
     Ok((group_id, wrong_password))
 }
 
+/// 读取 16 字节 Big-Endian UUID
+pub fn read_uuid<R: Read>(reader: &mut R) -> io::Result<Uuid> {
+    let mut uuid_bytes = [0u8; 16];
+    reader.read_exact(&mut uuid_bytes)?;
+    Ok(Uuid::from_bytes(uuid_bytes))
+}
+
+/// Simple Voice Chat 玩家语音状态 (PlayerState)
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SvcPlayerState {
+    pub disabled: bool,
+    pub disconnected: bool,
+    pub uuid: Uuid,
+    pub name: String,
+    pub group: Option<Uuid>,
+}
+
+impl SvcPlayerState {
+    /// 按 SVC 2.5.x / 2.6.x (compatibility_version <= 20) 格式解析 PlayerState
+    pub fn from_reader<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let disabled = reader.read_u8()? != 0;
+        let disconnected = reader.read_u8()? != 0;
+        let uuid = read_uuid(reader)?;
+        let name = read_mc_string(reader)?;
+        let has_group = reader.read_u8()? != 0;
+        let group = if has_group {
+            Some(read_uuid(reader)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            disabled,
+            disconnected,
+            uuid,
+            name,
+            group,
+        })
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        Self::from_reader(&mut cursor)
+    }
+}
+
+/// 解析 voicechat:states / voicechat:player_states 批量状态负载
+pub fn parse_player_states_packet(bytes: &[u8]) -> io::Result<Vec<SvcPlayerState>> {
+    let mut cursor = Cursor::new(bytes);
+    let count = cursor.read_i32::<BigEndian>()?;
+    if count < 0 || count > 10_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid player state count",
+        ));
+    }
+    let mut states = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        states.push(SvcPlayerState::from_reader(&mut cursor)?);
+    }
+    Ok(states)
+}
+
+/// 解析 voicechat:remove_state 负载 -> UUID
+pub fn parse_remove_state_packet(bytes: &[u8]) -> io::Result<Uuid> {
+    let mut cursor = Cursor::new(bytes);
+    read_uuid(&mut cursor)
+}
+
 /// 解析 voicechat:remove_group 负载 -> UUID
 pub fn parse_remove_group_packet(bytes: &[u8]) -> io::Result<Uuid> {
     let mut cursor = Cursor::new(bytes);
-    let mut uuid_bytes = [0u8; 16];
-    cursor.read_exact(&mut uuid_bytes)?;
-    Ok(Uuid::from_bytes(uuid_bytes))
+    read_uuid(&mut cursor)
 }
 

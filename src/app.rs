@@ -12,15 +12,16 @@ use crate::audio::{
 };
 use crate::config::Config;
 use crate::tools::ToolsManager;
-use crate::voice::protocol::SvcGroup;
+use crate::voice::protocol::{SvcGroup, SvcPlayerState};
 use crate::voice::VoiceClient;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupAction {
     JoinOrCreate {
         name: String,
         password: Option<String>,
         group_type: i16,
+        auto_create: bool,
     },
     JoinById {
         id: Uuid,
@@ -39,10 +40,12 @@ pub struct AppManager {
     pub mc_connected: Arc<AtomicBool>,
     pub voice_connected: Arc<AtomicBool>,
     pub secret_received: Arc<AtomicBool>,
+    pub bot_uuid: Arc<RwLock<Option<Uuid>>>,
     pub chat_sender: Arc<RwLock<Option<mpsc::Sender<String>>>>,
     pub last_tpa_accepted: Arc<Mutex<Option<tokio::time::Instant>>>,
     pub known_groups: Arc<RwLock<HashMap<Uuid, SvcGroup>>>,
     pub current_group: Arc<RwLock<Option<SvcGroup>>>,
+    pub known_player_states: Arc<RwLock<HashMap<Uuid, SvcPlayerState>>>,
     pub group_action_sender: Arc<RwLock<Option<mpsc::Sender<GroupAction>>>>,
 }
 
@@ -61,10 +64,12 @@ impl AppManager {
             mc_connected: Arc::new(AtomicBool::new(false)),
             voice_connected: Arc::new(AtomicBool::new(false)),
             secret_received: Arc::new(AtomicBool::new(false)),
+            bot_uuid: Arc::new(RwLock::new(None)),
             chat_sender: Arc::new(RwLock::new(None)),
             last_tpa_accepted: Arc::new(Mutex::new(None)),
             known_groups: Arc::new(RwLock::new(HashMap::new())),
             current_group: Arc::new(RwLock::new(None)),
+            known_player_states: Arc::new(RwLock::new(HashMap::new())),
             group_action_sender: Arc::new(RwLock::new(None)),
         });
 
@@ -191,6 +196,35 @@ impl AppManager {
                 *cur = None;
             }
         }
+    }
+
+    /// 记录假人自身在 SVC 中的 Player UUID
+    pub async fn set_bot_uuid(&self, uuid: Uuid) {
+        *self.bot_uuid.write().await = Some(uuid);
+    }
+
+    /// 获取假人自身在 SVC 中的 Player UUID
+    pub async fn get_bot_uuid(&self) -> Option<Uuid> {
+        *self.bot_uuid.read().await
+    }
+
+    /// 更新单个玩家的 SVC 语音状态
+    pub async fn update_player_state(&self, state: SvcPlayerState) {
+        self.known_player_states.write().await.insert(state.uuid, state);
+    }
+
+    /// 全量替换玩家 SVC 语音状态快照
+    pub async fn replace_player_states(&self, states: Vec<SvcPlayerState>) {
+        let mut map = self.known_player_states.write().await;
+        map.clear();
+        for s in states {
+            map.insert(s.uuid, s);
+        }
+    }
+
+    /// 移除指定玩家的 SVC 语音状态
+    pub async fn remove_player_state(&self, id: Uuid) {
+        self.known_player_states.write().await.remove(&id);
     }
 
     /// 默认点播曲目 (play_now = false)
